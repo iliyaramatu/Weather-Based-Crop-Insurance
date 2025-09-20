@@ -7,11 +7,13 @@
 (define-constant ERR_CONDITIONS_NOT_MET (err u105))
 (define-constant ERR_INVALID_ORACLE (err u106))
 (define-constant ERR_POLICY_ACTIVE (err u107))
+(define-constant ERR_INVALID_DISCOUNT (err u108))
 
 (define-data-var next-policy-id uint u1)
 (define-data-var total-premiums uint u0)
 (define-data-var total-payouts uint u0)
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
+(define-data-var total-farmers-with-discounts uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -52,6 +54,19 @@
   { authorized: bool, reputation: uint }
 )
 
+;; Farmer loyalty tracking for premium discounts
+(define-map farmer-loyalty
+  { farmer: principal }
+  { 
+    consecutive-seasons: uint,
+    total-policies: uint,
+    total-claims: uint,
+    last-policy-season: uint,
+    discount-percentage: uint,
+    loyalty-tier: (string-ascii 20)
+  }
+)
+
 (define-public (initialize-oracle (oracle principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -75,8 +90,11 @@
   (let
     (
       (policy-id (var-get next-policy-id))
-      (premium (calculate-premium coverage-amount (- harvest-date planting-date)))
+      (base-premium (calculate-premium coverage-amount (- harvest-date planting-date)))
+      (discount-percentage (get-farmer-discount-percentage tx-sender))
+      (premium (apply-premium-discount base-premium discount-percentage))
       (current-policies (default-to { policy-ids: (list) } (map-get? farmer-policies { farmer: tx-sender })))
+      (current-season (/ stacks-block-height u2016)) ;; Approximate season calculation
     )
     (asserts! (>= (stx-get-balance tx-sender) premium) ERR_INSUFFICIENT_FUNDS)
     (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
@@ -107,6 +125,7 @@
     
     (var-set next-policy-id (+ policy-id u1))
     (var-set total-premiums (+ (var-get total-premiums) premium))
+    (unwrap-panic (update-farmer-loyalty tx-sender current-season false))
     (ok policy-id)
   )
 )
@@ -162,6 +181,7 @@
             (merge policy { claimed: true, active: false })
           )
           (var-set total-payouts (+ (var-get total-payouts) payout-amount))
+          (unwrap-panic (update-farmer-loyalty (get farmer policy) (/ stacks-block-height u2016) true))
           (ok payout-amount)
         )
         ERR_CONDITIONS_NOT_MET
@@ -195,7 +215,7 @@
 (define-public (update-oracle-reputation (oracle principal) (new-reputation uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (<= new-reputation u100) (err u108))
+    (asserts! (<= new-reputation u100) (err u109))
     (map-set oracle-registry
       { oracle: oracle }
       (merge (default-to { authorized: false, reputation: u0 } 
@@ -203,6 +223,107 @@
              { reputation: new-reputation })
     )
     (ok true)
+  )
+)
+
+;; Update farmer loyalty stats and calculate discount eligibility
+(define-public (update-farmer-loyalty (farmer principal) (season uint) (filed-claim bool))
+  (let
+    (
+      (current-loyalty (default-to 
+        { 
+          consecutive-seasons: u0,
+          total-policies: u0,
+          total-claims: u0,
+          last-policy-season: u0,
+          discount-percentage: u0,
+          loyalty-tier: "bronze"
+        } 
+        (map-get? farmer-loyalty { farmer: farmer })))
+      (is-consecutive (or 
+        (is-eq (get last-policy-season current-loyalty) u0)
+        (is-eq season (+ (get last-policy-season current-loyalty) u1))))
+      (new-consecutive-seasons (if is-consecutive 
+        (+ (get consecutive-seasons current-loyalty) u1)
+        u1))
+      (new-total-policies (+ (get total-policies current-loyalty) u1))
+      (new-total-claims (if filed-claim 
+        (+ (get total-claims current-loyalty) u1)
+        (get total-claims current-loyalty)))
+      (new-discount-percentage (calculate-loyalty-discount new-consecutive-seasons new-total-claims))
+      (new-loyalty-tier (get-loyalty-tier new-consecutive-seasons))
+      (old-discount (get discount-percentage current-loyalty))
+    )
+    ;; Update discount counter if farmer gets their first discount
+    (if (and (is-eq old-discount u0) (> new-discount-percentage u0))
+      (var-set total-farmers-with-discounts (+ (var-get total-farmers-with-discounts) u1))
+      true
+    )
+    (map-set farmer-loyalty
+      { farmer: farmer }
+      {
+        consecutive-seasons: new-consecutive-seasons,
+        total-policies: new-total-policies,
+        total-claims: new-total-claims,
+        last-policy-season: season,
+        discount-percentage: new-discount-percentage,
+        loyalty-tier: new-loyalty-tier
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Calculate discount percentage based on consecutive seasons without claims
+(define-read-only (calculate-loyalty-discount (consecutive-seasons uint) (total-claims uint))
+  (if (is-eq total-claims u0)
+    (if (>= consecutive-seasons u8)
+      u20  ;; 20% discount for 8+ seasons
+      (if (>= consecutive-seasons u5)
+        u15  ;; 15% discount for 5-7 seasons
+        (if (>= consecutive-seasons u3)
+          u10  ;; 10% discount for 3-4 seasons
+          (if (>= consecutive-seasons u2)
+            u5   ;; 5% discount for 2+ seasons
+            u0   ;; No discount for first season
+          )
+        )
+      )
+    )
+    u0  ;; No discount if farmer has claims
+  )
+)
+
+;; Get loyalty tier based on consecutive seasons
+(define-read-only (get-loyalty-tier (consecutive-seasons uint))
+  (if (>= consecutive-seasons u8)
+    "platinum"
+    (if (>= consecutive-seasons u5)
+      "gold"
+      (if (>= consecutive-seasons u3)
+        "silver"
+        "bronze"
+      )
+    )
+  )
+)
+
+;; Apply discount to premium
+(define-read-only (apply-premium-discount (base-premium uint) (discount-percentage uint))
+  (let
+    ((discount-amount (/ (* base-premium discount-percentage) u100)))
+    (- base-premium discount-amount)
+  )
+)
+
+;; Get farmer's current discount percentage
+(define-read-only (get-farmer-discount-percentage (farmer principal))
+  (let
+    ((loyalty-info (map-get? farmer-loyalty { farmer: farmer })))
+    (match loyalty-info
+      info (get discount-percentage info)
+      u0
+    )
   )
 )
 
@@ -223,7 +344,21 @@
     total-policies: (- (var-get next-policy-id) u1),
     total-premiums: (var-get total-premiums),
     total-payouts: (var-get total-payouts),
-    contract-balance: (stx-get-balance (as-contract tx-sender))
+    contract-balance: (stx-get-balance (as-contract tx-sender)),
+    farmers-with-discounts: (var-get total-farmers-with-discounts)
+  }
+)
+
+;; Get farmer loyalty information
+(define-read-only (get-farmer-loyalty-info (farmer principal))
+  (map-get? farmer-loyalty { farmer: farmer })
+)
+
+;; Get all farmers eligible for discounts (owner only for analytics)
+(define-read-only (get-loyalty-statistics)
+  {
+    total-farmers-with-discounts: (var-get total-farmers-with-discounts),
+    loyalty-program-active: true
   }
 )
 
